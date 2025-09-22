@@ -10,7 +10,6 @@ htmlcov/
 
 # Env & virtualenv
 .env
-.env.*
 .venv/
 venv/
 
@@ -27,3 +26,4 @@ query_log.jsonl
 *.tsv
 
 
+*.jsonl

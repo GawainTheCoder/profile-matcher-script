@@ -71,7 +71,7 @@ python3 upwork_to_linkedin_matcher.py \
 - Take a sample of ~20 profiles with known ground truth.
 - Run once and compute precision@1 manually.
 - If false positives are high: raise `--accept-threshold` or require ≥3 unique signals for High confidence (already enforced), and keep the must-have role gate ON.
-- If recall is low: add 1–2 more attribute-pair queries, allow last-initial lock to bypass the must-have role gate, or enable `--llm-rerank` and slightly lower `--llm-keep-threshold`.
+- If recall is low: add 1–2 more attribute-pair queries, allow last-initial lock to bypass the must-have role gate, or run the standalone LLM selection step on the SERP output and experiment with a slightly lower keep threshold (e.g., 0.5–0.55).
 
 ## Input CSV schema (required columns)
 
@@ -105,6 +105,12 @@ One row per kept candidate (sorted by score or LLM relevance):
 - **confidence** (High | Medium | Low)
 - **matched_signals** (comma-joined signals)
 - **query_used** (the producing Google query)
+
+LLM-specific columns (present when the Responses API step runs):
+- **llm_selected** – `yes` for the model’s pick, `secondary` for remaining ranked options, blank if the model abstained
+- **llm_confidence** – model-reported 0–1 confidence (string formatted to two decimals)
+- **llm_rationale** – trimmed justification from the model (or the rejection reason when no match is chosen)
+- **llm_rank** – 1-based ordering assigned by the LLM (populated for secondary options)
 
 If a person yields no candidates after filtering, one placeholder row is written with empty LinkedIn fields and `match_score=0`.
 
@@ -165,22 +171,62 @@ Inclusion gate (precision control):
 
 ## Optional LLM reranker (OpenAI Responses API, `gpt-5-nano`)
 
-When `--llm-rerank` is passed, the top `--llm-top-k` rule-passing candidates are sent to the OpenAI Responses API with:
-- Row context: Full Name, Title, Skills, City, Country, Education, short Description
-- Candidate context: URL (and ccTLD), SERP title/snippet
-- Instruction to return strict JSON `{keep: boolean, relevance: 0..1, reason: string}`
+The LLM selection step (`llm_select_existing.py`) sends the top `--llm-top-k` candidates per row to the OpenAI Responses API. The payload contains:
 
-Filtering/ordering:
-- Keep if `keep=true` AND `relevance ≥ --llm-keep-threshold` (default 0.6)
-- Sort by `relevance` then by rule-based score
-- On API errors, falls back gracefully to rule-based ordering
+- **Upwork profile context** – full name and variants, first/last initial, title, top skills, description phrases, certifications, extracted schools/companies, employment summary, city/country, location aliases
+- **Candidate context** – LinkedIn URL, slug tokens, derived last initial, first-name-in-url flag, SERP title/snippet, rule score, producing query, matched signals
+- **Guardrails** – first name must align, last initial (when present) must match, favour role/location alignment, allow abstaining when confidence is low
 
-OpenAI usage visibility:
-- Requests include `store=true`, a `user` (Upwork full name, truncated), and `metadata` (source, row city/country) so calls appear in the OpenAI dashboard
-- If `OPENAI_ORG_ID` / `OPENAI_PROJECT_ID` are present, the script forwards them using the `OpenAI-Organization` / `OpenAI-Project` headers
+Responses are requested as JSON schema:
+```json
+{
+  "best_candidate_id": "cand_3" | null,
+  "confidence": 0.0-1.0,
+  "rationale": "short reasoning",
+  "secondary_candidate_ids": ["cand_5", "cand_2"],
+  "reject_reason": "optional explanation when no match"
+}
+```
 
-Cost control:
-- Only top `--llm-top-k` candidates per row are sent (default 5)
+Acceptance and ordering:
+- Accept only if `confidence ≥ --llm-keep-threshold` (default 0.6); otherwise fall back to rule ordering
+- Return a single candidate in `select` mode, or keep all ranked candidates in `assist` mode (primary + secondary ordering)
+- On API errors, the rule-based ordering is preserved
+
+Telemetry & attribution:
+- Requests use `store=true` and include metadata (`source`, row city/country) for observability in the OpenAI dashboard
+- `OPENAI_ORG_ID` / `OPENAI_PROJECT_ID` headers are forwarded when present
+
+Token/cost control:
+- Only the top `--llm-top-k` (default 5) candidates are sent
+- `max_output_tokens` is capped (900) and `reasoning.effort` is set to `low` for nano-tier models
+
+> **Prompt engineering notes**
+> - Injecting the full Upwork profile (skills, employment, education, certifications, description snippets) materially improves discrimination on common names.
+> - Providing slug tokens and location aliases helps the model reason about URL structure and geographic hints beyond the snippet.
+> - Keep the schema strict (`additionalProperties=false`) so malformed outputs are rejected early.
+
+### LLM-only pass on existing SERP output
+
+Already have a SERP results CSV (e.g., `test_output_20.csv`)? Run the LLM selection step without hitting the search API:
+
+```bash
+python3 llm_select_existing.py \
+  --upwork 20_upwork_profiles.csv \
+  --candidates test_output_20.csv \
+  --output 20_upwork_llm_results.csv \
+  --llm-model gpt-5-nano-2025-08-07 \
+  --llm-keep-threshold 0.6 \
+  --query-log query_log_llm.jsonl
+```
+
+What happens under the hood:
+- Rebuilds the same `RowFeatures` objects from the original Upwork CSV (so the LLM still sees full descriptions, education, employment, certifications, etc.)
+- Converts each candidate row into `CandidateEvidence` (rule score, matched signals, slug tokens, derived last initial, producing query)
+- Pipes the top `--llm-top-k` candidates per freelancer into the Responses API and annotates the results with `llm_selected`, `llm_confidence`, `llm_rationale`, and `llm_rank`
+- Optionally logs the full (truncated) JSON responses for audit/debugging
+
+This is the recommended workflow when you already have a `test_output.csv` from an earlier run and just want to layer the LLM decisioning on top.
 
 ---
 
@@ -197,7 +243,7 @@ Search keys:
 - For Serper: `SERPER_API_KEY=...`
 - For SerpAPI: `SERPAPI_API_KEY=...`
 
-LLM keys (only if `--llm-rerank`):
+LLM keys (only if you plan to run the LLM selection script):
 - `OPENAI_API_KEY=...`
 - Optional attribution: `OPENAI_ORG_ID=...`, `OPENAI_PROJECT_ID=...`
 
@@ -241,10 +287,6 @@ OPENAI_API_KEY=YOUR_OPENAI_KEY
 - `--sleep-min` (default 0.8), `--sleep-max` (default 1.8)
 - `--min-score` (default 3)
 - `--no-require-role-signal` (disable must-have role/freelance gate)
-- `--llm-rerank` (enable OpenAI reranker)
-- `--llm-model` (default `gpt-5-nano`)
-- `--llm-top-k` (default 5)
-- `--llm-keep-threshold` (default 0.6)
 
 ---
 
@@ -259,19 +301,19 @@ python3 upwork_to_linkedin_matcher.py \
   --max-queries 6 --results-per-query 5
 ```
 
-With must-have gate (default) and LLM reranker:
+Add the LLM post-processing step:
 ```bash
-python3 upwork_to_linkedin_matcher.py \
-  --input latest_people.csv \
-  --output latest_people_llm_all.csv \
-  --provider serper \
-  --max-queries 6 --results-per-query 5 \
-  --llm-rerank
+python3 llm_select_existing.py \
+  --upwork latest_people.csv \
+  --candidates test_output.csv \
+  --output latest_people_llm.csv \
+  --llm-model gpt-5-nano-2025-08-07 \
+  --llm-keep-threshold 0.6
 ```
 
 Tighten precision further:
 - Raise `--min-score` to 7–8
-- Keep must-have gate ON, rely on LLM reranker
+- Keep must-have gate ON and run the LLM selection with a higher `--llm-keep-threshold`
 
 Notes:
 - Increase `--sleep-*` for politeness and to avoid rate limits
@@ -282,7 +324,7 @@ Notes:
 ## Tuning recall vs precision
 
 - More recall: lower `--min-score`, disable must-have (`--no-require-role-signal`), raise `--results-per-query`
-- More precision: keep must-have ON, raise `--min-score`, use `--llm-rerank`, maybe lower `--llm-top-k` / raise `--llm-keep-threshold`
+- More precision: keep must-have ON, raise `--min-score`, and layer the LLM selection pass on top of the SERP CSV (optionally tightening `--llm-keep-threshold` or reducing `--llm-top-k` there)
 
 ---
 
@@ -291,7 +333,7 @@ Notes:
 - **SERP snippets**: scoring depends on visible title/snippet; if signals aren’t shown, good candidates can be missed
 - **Name ambiguity**: first-name + last initial is weak for very common names; gates + LLM reduce but don’t eliminate edge cases
 - **Heuristic extraction**: school/company parsing is best-effort
-- **LLM cost/latency**: controlled via `--llm-top-k`; still adds overhead
+- **LLM cost/latency**: controlled via the selection script’s `--llm-top-k`; still adds overhead
 - **Globalization**: non-English/transliterated names may lower quality; tune `--hl`/`--gl`
 
 ---
@@ -315,10 +357,10 @@ Notes:
 
 - No matches for some rows
   - Loosen: `--no-require-role-signal` or lower `--min-score`
-  - Or add `--llm-rerank` and lower `--llm-keep-threshold` slightly (e.g., 0.5)
+  - Or run the LLM selection script with a lower `--llm-keep-threshold` (e.g., 0.5) to let the model surface borderline matches
 
 - Too many irrelevant matches
-  - Keep must-have ON, raise `--min-score` (7–8), and use `--llm-rerank`
+  - Keep must-have ON, raise `--min-score` (7–8), and run the LLM selection pass with a higher `--llm-keep-threshold`
 
 - See LLM spend/logs on OpenAI platform
   - Ensure `OPENAI_API_KEY` is set; calls are sent with `store=true`, `user`, and `metadata`
@@ -329,4 +371,3 @@ Notes:
 ## Safety & compliance
 
 Use SERP providers within their ToS and rate limits. Respect local laws and target platform policies. This tool relies on public SERPs and does not crawl LinkedIn pages directly.
-

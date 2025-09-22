@@ -41,6 +41,7 @@ Env vars:
   OPENAI_PROJECT_ID=...         (optional, for dashboard attribution)
 """
 import os, re, csv, time, json, argparse, random
+from dataclasses import dataclass, field
 from typing import Dict, List, Any, Tuple, Optional
 import requests
 
@@ -139,6 +140,51 @@ STOPWORDS = set("""
 a an and are as at be by for from has have i in is it of on or that the to with your you
 """.split())
 
+
+@dataclass
+class RowFeatures:
+    raw: Dict[str, str]
+    full_name: str
+    first_name: str
+    last_initial: str
+    name_variants: List[str]
+    best_name: str
+    core_without_initial: str
+    title_phrases: List[str]
+    top_skills: List[str]
+    schools: List[str]
+    companies: List[str]
+    description_phrases: List[str]
+    location_tokens: List[str]
+    location_aliases: List[str]
+    city: str
+    country: str
+    primary_phrase: str
+    upwork_location: str
+    certifications: List[str]
+    profile_url: str
+    llm_decision: Optional[Dict[str, Any]] = None
+
+
+@dataclass
+class CandidateEvidence:
+    candidate_id: str
+    score: int
+    signals: List[str]
+    raw_item: Dict[str, str]
+    query: str
+    rule_rank: int
+    url: str
+    slug_tokens: List[str] = field(default_factory=list)
+    derived_last_initial: str = ""
+    first_name_in_url: bool = False
+    rejection_reason: Optional[str] = None
+    llm_selected: bool = False
+    llm_confidence: Optional[float] = None
+    llm_rationale: Optional[str] = None
+    llm_rank: Optional[int] = None
+    llm_reject_reason: Optional[str] = None
+
 def append_log(log_handle, payload: Dict[str, Any]) -> None:
     if not log_handle:
         return
@@ -151,6 +197,13 @@ def append_log(log_handle, payload: Dict[str, Any]) -> None:
 
 def norm(s: str) -> str:
     return (s or "").strip()
+
+
+def truncate_text(text: str, limit: int = 400) -> str:
+    text = text or ""
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 3)] + "..."
 
 def parse_full_name(full_name: str) -> Tuple[str, str]:
     """Return (first_name, last_initial) from an Upwork-style Full Name.
@@ -298,6 +351,91 @@ def derive_location_aliases(country: str, *texts: str) -> List[str]:
         if any(v in normalized_texts for v in variants):
             aliases.extend(sorted({v.title() for v in variants}))
     return aliases
+
+
+def extract_certifications(certifications: str, k: int = 3) -> List[str]:
+    if not certifications:
+        return []
+    parts = [c.strip() for c in re.split(r"[|,/;\n]+", certifications) if c.strip()]
+    # Preserve original order while deduping
+    seen: List[str] = []
+    for part in parts:
+        if part and part not in seen:
+            seen.append(part)
+        if len(seen) >= k:
+            break
+    return seen
+
+
+def prepare_row_features(row: Dict[str, str]) -> RowFeatures:
+    raw_full = norm(row.get("Full Name"))
+    fn, last_initial = parse_full_name(raw_full)
+    full_clean = " ".join([p for p in re.split(r"\s+", raw_full.replace(".", " ")) if p])
+    full = full_clean
+
+    city = norm(row.get("City"))
+    country = norm(row.get("Country"))
+    title = norm(row.get("Title"))
+    skills = norm(row.get("Skills"))
+    edu = norm(row.get("Education"))
+    desc = norm(row.get("Description"))
+    employment = norm(row.get("Employment History"))
+    certs = extract_certifications(norm(row.get("Certifications")))
+    profile_url = norm(row.get("Profile URL"))
+
+    title_phrases = tokenize_phrases(title)
+    top_sk = pick_top_skills(skills)
+    schools = extract_schools(edu)
+    companies = extract_companies(employment)
+    desc_phrases = extract_description_phrases(desc)
+    location_tokens = extract_locations(edu, desc, employment)
+    location_aliases = derive_location_aliases(country, edu, desc, employment)
+    combined_locations = list(dict.fromkeys(location_tokens + location_aliases))
+
+    name_variants: List[str] = []
+    name_parts = [p for p in full.split() if p]
+    has_full_last = len(name_parts) >= 2 and len(name_parts[-1]) > 1
+    core_without_initial = ""
+    if len(name_parts) >= 2 and len(name_parts[-1]) == 1:
+        core_without_initial = " ".join(name_parts[:-1])
+    if full and has_full_last:
+        name_variants.append(full)
+    elif full:
+        name_variants.append(full.replace(".", ""))
+    if core_without_initial:
+        name_variants.append(core_without_initial)
+    if last_initial:
+        name_variants.append(f"{fn} {last_initial}")
+    if fn:
+        name_variants.append(fn)
+    name_variants = list(dict.fromkeys([n for n in name_variants if n]))
+
+    best_name = name_variants[0] if name_variants else fn
+    primary_phrase = title_phrases[0] if title_phrases else (top_sk[0] if top_sk else "")
+    upwork_location = f"{city}, {country}".strip(", ")
+
+    return RowFeatures(
+        raw=row,
+        full_name=raw_full,
+        first_name=fn,
+        last_initial=last_initial,
+        name_variants=name_variants,
+        best_name=best_name,
+        core_without_initial=core_without_initial,
+        title_phrases=title_phrases,
+        top_skills=top_sk,
+        schools=schools,
+        companies=companies,
+        description_phrases=desc_phrases,
+        location_tokens=combined_locations,
+        location_aliases=location_aliases,
+        city=city,
+        country=country,
+        primary_phrase=primary_phrase,
+        upwork_location=upwork_location,
+        certifications=certs,
+        profile_url=profile_url,
+    )
 def parse_candidate_last_initial(item: Dict[str, str]) -> str:
     """Best-effort extraction of last-name initial from SERP result title or URL.
     Returns uppercase initial or empty string if unknown or ambiguous."""
@@ -320,52 +458,33 @@ def parse_candidate_last_initial(item: Dict[str, str]) -> str:
         return tokens[-1][0].upper()
     return ""
 
-def build_queries(row: Dict[str, str], max_queries: int = 6) -> List[str]:
-    raw_full = norm(row.get("Full Name"))
-    fn, last_initial = parse_full_name(raw_full)
-    full_clean = " ".join([p for p in re.split(r"\s+", raw_full.replace(".", " ")) if p])
-    full = full_clean
-    city = norm(row.get("City"))
-    country = norm(row.get("Country"))
-    title = norm(row.get("Title"))
-    skills = norm(row.get("Skills"))
-    edu = norm(row.get("Education"))
-    desc = norm(row.get("Description"))
-    employment = norm(row.get("Employment History"))
 
-    title_phrases = tokenize_phrases(title)
-    top_sk = pick_top_skills(skills)
-    schools = extract_schools(edu)
-    companies = extract_companies(employment)
-    desc_phrases = extract_description_phrases(desc)
-    location_tokens = extract_locations(edu, desc, employment)
-    location_tokens.extend(
-        derive_location_aliases(country, edu, desc, employment)
-    )
-    location_tokens = list(dict.fromkeys(location_tokens))
+def extract_candidate_slug_tokens(url: str) -> List[str]:
+    try:
+        m = re.search(r"linkedin\.com/(?:in|pub)/([^/?#]+)", (url or "").lower())
+        if not m:
+            return []
+        slug = m.group(1)
+        return [p for p in re.split(r"[-_]+", slug) if p]
+    except Exception:
+        return []
 
-    # Build name variants from most precise to broader
-    name_variants: List[str] = []
-    name_parts = [p for p in full.split() if p]
-    has_full_last = len(name_parts) >= 2 and len(name_parts[-1]) > 1
-    core_without_initial = ""
-    if len(name_parts) >= 2 and len(name_parts[-1]) == 1:
-        core_without_initial = " ".join(name_parts[:-1])
-    if full and has_full_last:
-        name_variants.append(full)
-    elif full:
-        name_variants.append(full.replace(".", ""))
-    if core_without_initial:
-        name_variants.append(core_without_initial)
-    if last_initial:
-        name_variants.append(f"{fn} {last_initial}")
-    if fn:
-        name_variants.append(fn)
-    name_variants = list(dict.fromkeys([n for n in name_variants if n]))
-
-    best_name = name_variants[0] if name_variants else fn
+def build_queries(features: RowFeatures, max_queries: int = 6) -> List[str]:
+    city = features.city
+    country = features.country
+    title = norm(features.raw.get("Title"))
+    schools = features.schools
+    top_sk = features.top_skills
+    title_phrases = features.title_phrases
+    desc_phrases = features.description_phrases
+    companies = features.companies
+    name_variants = features.name_variants
+    best_name = features.best_name
+    fn = features.first_name
     location_hint = city or country
-    primary_phrase = title_phrases[0] if title_phrases else (top_sk[0] if top_sk else "")
+    primary_phrase = features.primary_phrase
+    core_without_initial = features.core_without_initial
+    location_tokens = features.location_tokens
 
     ordered_queries: List[str] = []
 
@@ -374,7 +493,7 @@ def build_queries(row: Dict[str, str], max_queries: int = 6) -> List[str]:
             ordered_queries.append(q.strip())
 
     # Tier 1: Full name pairings first (location, education, skills, title)
-    primary_names = []
+    primary_names: List[str] = []
     if best_name:
         primary_names.append(best_name)
     for variant in name_variants:
@@ -459,7 +578,7 @@ def build_queries(row: Dict[str, str], max_queries: int = 6) -> List[str]:
             break
     return queries
 
-def score_candidate(item: Dict[str, str], row: Dict[str, str]) -> Tuple[int, List[str]]:
+def score_candidate(item: Dict[str, str], features: RowFeatures) -> Tuple[int, List[str]]:
     """Additive scoring using title/snippet evidence with signal tracking."""
     title_text = item.get("title", "")
     snippet = item.get("snippet", "")
@@ -469,12 +588,14 @@ def score_candidate(item: Dict[str, str], row: Dict[str, str]) -> Tuple[int, Lis
     score = 0
 
     # Name guard: allow matches if first name appears in snippet/title or URL
-    full = norm(row.get("Full Name"))
-    fn, last_initial = parse_full_name(full)
+    fn = features.first_name
+    last_initial = features.last_initial
     fn_lc = (fn or "").strip().lower()
+    slug_tokens = extract_candidate_slug_tokens(url_txt)
+    fn_in_slug = fn_lc in slug_tokens if fn_lc else False
     if fn_lc:
         name_in_text = fn_lc in txt
-        name_in_url = re.search(rf"/(?:in|pub)/[^/]*{re.escape(fn_lc)}", url_txt)
+        name_in_url = bool(re.search(rf"/(?:in|pub)/[^/]*{re.escape(fn_lc)}", url_txt) or fn_in_slug)
         if not name_in_text and not name_in_url:
             return -999, ["reject:no-first-name"]
 
@@ -486,9 +607,9 @@ def score_candidate(item: Dict[str, str], row: Dict[str, str]) -> Tuple[int, Lis
         score += 5
         signals.append("last_initial")
 
-    city = (row.get("City") or "").strip().lower()
-    country = (row.get("Country") or "").strip().lower()
-    alt_locations = [loc.lower() for loc in extract_locations(row.get("Education", ""), row.get("Description", ""), row.get("Employment History", ""))]
+    city = (features.city or "").strip().lower()
+    country = (features.country or "").strip().lower()
+    alt_locations = [loc.lower() for loc in features.location_tokens]
     if city and city in txt:
         score += 5
         signals.append("city")
@@ -503,32 +624,37 @@ def score_candidate(item: Dict[str, str], row: Dict[str, str]) -> Tuple[int, Lis
                 break
 
     # Role/title phrases
-    title_phrases = [p.lower() for p in tokenize_phrases(row.get("Title", ""))]
+    title_phrases = [p.lower() for p in features.title_phrases]
     if any(p in txt for p in title_phrases):
         score += 4
         signals.append("title_phrase")
 
-    skills = [sk.lower() for sk in pick_top_skills(row.get("Skills", ""))]
+    skills = [sk.lower() for sk in features.top_skills]
     if any(sk in txt for sk in skills):
         score += 3
         signals.append("skill")
 
-    edu_hits = [ed.lower() for ed in extract_schools(row.get("Education", ""))]
+    edu_hits = [ed.lower() for ed in features.schools]
     if any(ed in txt for ed in edu_hits):
         score += 3
         signals.append("education")
 
     # Company evidence
-    for comp in [c.lower() for c in extract_companies(row.get("Employment History", ""))]:
+    for comp in [c.lower() for c in features.companies]:
         if comp and comp in txt:
             score += 3
             signals.append("company")
             break
 
-    desc_hits = [d.lower() for d in extract_description_phrases(row.get("Description", ""))]
+    desc_hits = [d.lower() for d in features.description_phrases]
     if any(d in txt for d in desc_hits):
         score += 2
         signals.append("description")
+
+    cert_hits = [c.lower() for c in features.certifications]
+    if any(cert in txt for cert in cert_hits):
+        score += 2
+        signals.append("certification")
 
     if re.search(r"\b\d{1,2}\+?\s+(?:years|yrs)\b", txt):
         score += 2
@@ -551,6 +677,54 @@ def pick_confidence(score: int, accept: int, review: int) -> str:
 
 # ---------------------------- LLM Reranker -----------------------------
 
+
+def build_llm_match_payload(features: RowFeatures, candidates: List[CandidateEvidence]) -> Dict[str, Any]:
+    upwork_profile = {
+        "full_name": features.full_name,
+        "first_name": features.first_name,
+        "last_initial": features.last_initial,
+        "title": norm(features.raw.get("Title")),
+        "skills_text": norm(features.raw.get("Skills"))[:400],
+        "top_skills": features.top_skills,
+        "city": features.city,
+        "country": features.country,
+        "location_tokens": features.location_tokens[:5],
+        "name_variants": features.name_variants[:5],
+        "primary_phrase": features.primary_phrase,
+        "schools": features.schools,
+        "companies": features.companies,
+        "description_phrases": features.description_phrases,
+        "certifications": features.certifications,
+        "profile_url": features.profile_url,
+        "description_excerpt": truncate_text(norm(features.raw.get("Description")), 600),
+        "employment_history_excerpt": truncate_text(norm(features.raw.get("Employment History")), 600),
+        "education_excerpt": truncate_text(norm(features.raw.get("Education")), 400),
+    }
+
+    linkedin_candidates: List[Dict[str, Any]] = []
+    for cand in candidates:
+        item = cand.raw_item
+        linkedin_candidates.append({
+            "candidate_id": cand.candidate_id,
+            "rule_score": cand.score,
+            "rule_rank": cand.rule_rank,
+            "url": cand.url,
+            "title": item.get("title", ""),
+            "snippet": truncate_text(item.get("snippet", ""), 500),
+            "query": cand.query,
+            "slug_tokens": cand.slug_tokens,
+            "derived_last_initial": cand.derived_last_initial,
+            "first_name_in_url": cand.first_name_in_url,
+            "signals": [s for s in cand.signals if not s.startswith("reject")],
+            "raw_signals": cand.signals,
+        })
+
+    return {
+        "upwork_profile": upwork_profile,
+        "linkedin_candidates": linkedin_candidates,
+    }
+
+
 def extract_cctld(url: str) -> str:
     try:
         m = re.search(r"https?://([a-z]{2,3})\\.linkedin\\.com/", (url or "").lower())
@@ -558,109 +732,278 @@ def extract_cctld(url: str) -> str:
     except Exception:
         return ""
 
+
+def parse_responses_json(data: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(data, dict):
+        return {}
+
+    output = data.get("output")
+    if isinstance(output, list):
+        for block in output:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "message":
+                contents = block.get("content")
+                if isinstance(contents, list):
+                    for item in contents:
+                        if not isinstance(item, dict):
+                            continue
+                        if item.get("type") in {"output_text", "reasoning_text", "text"}:
+                            text = item.get("text")
+                            if isinstance(text, str):
+                                try:
+                                    return json.loads(text)
+                                except json.JSONDecodeError:
+                                    continue
+            if block.get("type") == "json" and isinstance(block.get("json"), dict):
+                return block["json"]
+            text = block.get("text")
+            if isinstance(text, str):
+                try:
+                    return json.loads(text)
+                except json.JSONDecodeError:
+                    continue
+
+    output_text = data.get("output_text")
+    if isinstance(output_text, str):
+        try:
+            return json.loads(output_text)
+        except json.JSONDecodeError:
+            pass
+
+    content = data.get("content")
+    if isinstance(content, str):
+        try:
+            return json.loads(content)
+        except json.JSONDecodeError:
+            pass
+
+    choices = data.get("choices")
+    if isinstance(choices, list):
+        for choice in choices:
+            if not isinstance(choice, dict):
+                continue
+            message = choice.get("message")
+            if isinstance(message, dict):
+                msg_content = message.get("content")
+                if isinstance(msg_content, str):
+                    try:
+                        return json.loads(msg_content)
+                    except json.JSONDecodeError:
+                        continue
+            text = choice.get("text")
+            if isinstance(text, str):
+                try:
+                    return json.loads(text)
+                except json.JSONDecodeError:
+                    continue
+
+    return {}
+
 def llm_rerank_candidates(
-    row: Dict[str, str],
-    candidates: List[Tuple[int, List[str], Dict[str, str], str]],
+    features: RowFeatures,
+    candidates: List[CandidateEvidence],
     model: str = "gpt-5-nano",
     keep_threshold: float = 0.6,
     top_k: int = 5,
-) -> List[Tuple[int, List[str], Dict[str, str], str]]:
-    """Use OpenAI Responses API to re-rank and optionally filter candidates.
-    Returns a possibly reduced, re-ordered list of candidates.
+    mode: str = "select",
+) -> List[CandidateEvidence]:
+    """Delegate final match selection to the Responses API.
+
+    Returns candidates reordered according to the LLM decision. When the
+    model declines the match or confidence is low, the original candidate
+    ordering is returned as a fallback.
     """
     api_key = os.getenv("OPENAI_API_KEY", "").strip()
     if not api_key or not candidates:
         return candidates
 
-    # Take top_k by rule-based score first
-    top = sorted(candidates, key=lambda x: x[0], reverse=True)[:max(1, top_k)]
+    candidate_pool = sorted(candidates, key=lambda c: c.score, reverse=True)
+    top_candidates = candidate_pool[:max(1, top_k)]
 
-    reranked: List[Tuple[float, Tuple[int, List[str], Dict[str, str], str]]] = []
+    payload_body = build_llm_match_payload(features, top_candidates)
 
-    for score, signals, item, q in top:
-        url = item.get("link", "")
-        payload = {
-            "model": model,
-            "input": (
-                "Decide if the LinkedIn result likely matches the Upwork freelancer. "
-                "Return strict JSON with keys keep (boolean), relevance (0..1), reason (short).\n\n"
-                f"Upwork Freelancer:\n"
-                f"- Full Name: {norm(row.get('Full Name'))}\n"
-                f"- Title: {norm(row.get('Title'))}\n"
-                f"- Skills: {norm(row.get('Skills'))}\n"
-                f"- Location: {norm(row.get('City'))}, {norm(row.get('Country'))}\n"
-                f"- Education: {norm(row.get('Education'))}\n"
-                f"- Description: {norm(row.get('Description'))[:300]}\n\n"
-                f"LinkedIn Candidate:\n"
-                f"- URL: {url}\n"
-                f"- ccTLD: {extract_cctld(url)}\n"
-                f"- Title: {item.get('title','')}\n"
-                f"- Snippet: {item.get('snippet','')}\n\n"
-                "Constraints: First name must match and last initial has been pre-validated when present. "
-                "Prioritize role/title and location alignment.\n"
-                "Respond ONLY with JSON: {\"keep\": true|false, \"relevance\": number 0..1, \"reason\": string}."
-            ),
-            "temperature": 0,
-            "max_output_tokens": 120,
-            "store": True,
-            "user": (norm(row.get('Full Name')) or "upwork_matcher")[:64],
-            "metadata": {
-                "source": "upwork_to_linkedin_matcher",
-                "row_city": norm(row.get('City')),
-                "row_country": norm(row.get('Country')),
-            }
-            # Structured output can be enabled if supported; keep simple parsing for portability.
-        }
+    schema = {
+        "type": "json_schema",
+        "name": "match_decision",
+        "schema": {
+            "type": "object",
+            "properties": {
+                "best_candidate_id": {"type": ["string", "null"]},
+                "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                "rationale": {"type": "string"},
+                "secondary_candidate_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "default": []
+                },
+                "reject_reason": {"type": ["string", "null"], "default": None},
+            },
+            "required": [
+                "best_candidate_id",
+                "confidence",
+                "rationale",
+                "secondary_candidate_ids",
+                "reject_reason",
+            ],
+            "additionalProperties": False,
+        },
+    }
+
+    system_prompt = (
+        "You are a sourcing analyst. Pick the LinkedIn profile that best matches the "
+        "Upwork freelancer. Require the same first name (case-insensitive). Enforce last "
+        "initial when Upwork provides one. Prefer evidence of matching roles, skills, "
+        "companies, locations, certifications, and freelance context. Decline with a "
+        "reject reason if none are suitable. Output JSON that follows the provided schema."
+    )
+
+    user_prompt = (
+        "Upwork + LinkedIn evidence (JSON):\n" +
+        json.dumps(payload_body, ensure_ascii=False)
+    )
+
+    request_payload = {
+        "model": model,
+        "max_output_tokens": 900,
+        "text": {
+            "format": schema,
+        },
+        "reasoning": {"effort": "low"},
+        "input": [
+            {
+                "role": "system",
+                "content": [{"type": "input_text", "text": system_prompt}],
+            },
+            {
+                "role": "user",
+                "content": [{"type": "input_text", "text": user_prompt}],
+            },
+        ],
+        "metadata": {
+            "source": "upwork_to_linkedin_matcher",
+            "row_city": features.city,
+            "row_country": features.country,
+        },
+    }
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    org_id = os.getenv("OPENAI_ORG_ID", "").strip()
+    project_id = os.getenv("OPENAI_PROJECT_ID", "").strip()
+    if org_id:
+        headers["OpenAI-Organization"] = org_id
+    if project_id:
+        headers["OpenAI-Project"] = project_id
+
+    decision: Dict[str, Any] = {}
+    try:
+        resp = requests.post(
+            "https://api.openai.com/v1/responses",
+            headers=headers,
+            data=json.dumps(request_payload),
+            timeout=45,
+        )
+        resp.raise_for_status()
+        raw_response = resp.json()
+        decision = parse_responses_json(raw_response)
+    except requests.HTTPError as exc:
+        err_text = ""
         try:
-            org_id = os.getenv("OPENAI_ORG_ID", "").strip()
-            project_id = os.getenv("OPENAI_PROJECT_ID", "").strip()
-            headers = {
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            }
-            if org_id:
-                headers["OpenAI-Organization"] = org_id
-            if project_id:
-                headers["OpenAI-Project"] = project_id
-            resp = requests.post(
-                "https://api.openai.com/v1/responses",
-                headers=headers,
-                data=json.dumps(payload),
-                timeout=30,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            # Responses API returns choices-like content; try to extract text
-            text = ""
-            if isinstance(data, dict):
-                # Various SDKs wrap output differently; try generic paths
-                text = data.get("output_text") or data.get("content") or ""
-                if not text and "output" in data:
-                    text = data["output"]
-                if not text and "choices" in data and data["choices"]:
-                    choice = data["choices"][0]
-                    text = choice.get("message", {}).get("content", "") or choice.get("text", "")
-            decision = {"keep": True, "relevance": 0.5, "reason": ""}
-            if text:
-                # Attempt to find JSON within the text
-                m = re.search(r"\{[\s\S]*\}", text)
-                if m:
-                    decision = json.loads(m.group(0))
-            rel = float(decision.get("relevance", 0.0))
-            keep = bool(decision.get("keep", False))
-            if keep and rel >= keep_threshold:
-                reranked.append((rel, (score, signals, item, q)))
+            err_text = exc.response.text
         except Exception:
-            # On any error, fall back to keeping the candidate as-is with neutral relevance
-            reranked.append((0.5, (score, signals, item, q)))
+            err_text = ""
+        features.llm_decision = {
+            "error": str(exc),
+            "error_body": err_text,
+            "model": model,
+            "request_payload": request_payload,
+            "used_candidates": [c.candidate_id for c in top_candidates],
+            "timestamp": time.time(),
+        }
+        return candidate_pool
+    except Exception as exc:
+        features.llm_decision = {
+            "error": str(exc),
+            "model": model,
+            "request_payload": request_payload,
+            "used_candidates": [c.candidate_id for c in top_candidates],
+            "timestamp": time.time(),
+        }
+        return candidate_pool
 
-    # Sort by LLM relevance then original score
-    reranked.sort(key=lambda x: x[0], reverse=True)
-    kept = [entry for _, entry in reranked]
-    # If nothing passed threshold, fall back to original candidates
-    return kept or candidates
+    if not isinstance(decision, dict):
+        decision = {}
+
+    features.llm_decision = {
+        "decision": decision,
+        "model": model,
+        "used_candidates": [c.candidate_id for c in top_candidates],
+        "timestamp": time.time(),
+        "raw_response": raw_response,
+    }
+
+    best_id = decision.get("best_candidate_id")
+    confidence = float(decision.get("confidence", 0.0) or 0.0)
+    rationale = decision.get("rationale") or ""
+    secondary_ids = decision.get("secondary_candidate_ids") or []
+    reject_reason = decision.get("reject_reason")
+
+    candidate_lookup = {cand.candidate_id: cand for cand in candidate_pool}
+    for cand in candidate_pool:
+        cand.llm_selected = False
+        cand.llm_confidence = None
+        cand.llm_rationale = None
+        cand.llm_rank = None
+        cand.llm_reject_reason = None
+
+    selected: Optional[CandidateEvidence] = None
+    if best_id and best_id in candidate_lookup and confidence >= keep_threshold:
+        selected = candidate_lookup[best_id]
+        selected.llm_selected = True
+        selected.llm_confidence = confidence
+        selected.llm_rationale = rationale
+        selected.llm_rank = 1
+
+    if selected is None:
+        # No confident pick -> optionally annotate reason and fall back
+        if reject_reason:
+            for cand in candidate_pool:
+                cand.llm_reject_reason = reject_reason
+        # Attach whatever confidence/rationale we got to top candidate for logging
+        if best_id and best_id in candidate_lookup:
+            candidate_lookup[best_id].llm_confidence = confidence
+            candidate_lookup[best_id].llm_rationale = rationale
+        return candidate_pool
+
+    ordered: List[CandidateEvidence] = [selected]
+    for idx, cid in enumerate(secondary_ids, start=2):
+        cand = candidate_lookup.get(cid)
+        if not cand or cand is selected:
+            continue
+        cand.llm_rank = idx
+        cand.llm_rationale = cand.llm_rationale or rationale
+        ordered.append(cand)
+
+    for cand in candidate_pool:
+        if cand not in ordered:
+            ordered.append(cand)
+
+    if mode == "select":
+        return ordered[: max(1, len(secondary_ids) + 1)]
+    return ordered
 
 # ------------------------------- Runner ------------------------------
+
+
+def validate_args(args) -> None:
+    if args.sleep_min < 0 or args.sleep_max < 0:
+        raise ValueError("Sleep intervals must be non-negative")
+    if args.sleep_min > args.sleep_max:
+        raise ValueError("--sleep-min cannot exceed --sleep-max")
+
 
 def main():
     ap = argparse.ArgumentParser()
@@ -677,13 +1020,14 @@ def main():
     ap.add_argument("--sleep-max", type=float, default=1.8)
     ap.add_argument("--min-score", type=int, default=3, help="Minimum score to include a candidate")
     ap.add_argument("--no-require-role-signal", action="store_true", help="Disable role/freelance must-have gate")
-    ap.add_argument("--llm-rerank", action="store_true", help="Enable LLM-based reranking using gpt-5-nano")
-    ap.add_argument("--llm-model", default="gpt-5-nano-2025-08-07")
-    ap.add_argument("--llm-top-k", type=int, default=5)
-    ap.add_argument("--llm-keep-threshold", type=float, default=0.6)
     ap.add_argument("--debug-serp", action="store_true", help="Log queries and raw SERP items for inspection")
     ap.add_argument("--query-log", help="Path to append JSONL diagnostics for queries and candidates")
     args = ap.parse_args()
+
+    try:
+        validate_args(args)
+    except ValueError as exc:
+        ap.error(str(exc))
 
     if args.provider == "serper":
         provider = SerperProvider(os.getenv("SERPER_API_KEY",""))
@@ -699,21 +1043,24 @@ def main():
             output_fieldnames = [
                 "upwork_name", "upwork_title", "upwork_location", "upwork_skills",
                 "linkedin_url", "linkedin_title", "linkedin_snippet", 
-                "match_score", "confidence", "matched_signals", "query_used"
+                "match_score", "confidence", "matched_signals", "query_used",
+                "llm_selected", "llm_confidence", "llm_rationale", "llm_rank"
             ]
             writer = csv.DictWriter(out, fieldnames=output_fieldnames)
             writer.writeheader()
 
             for row_idx, row in enumerate(reader, start=1):
-                queries = build_queries(row, max_queries=args.max_queries)
-                candidates = []  # Store all candidates, not just the best one
+                features = prepare_row_features(row)
+                queries = build_queries(features, max_queries=args.max_queries)
+                candidates: List[CandidateEvidence] = []
                 seen_urls = set()
                 strong_hit_found = False
+                candidate_counter = 0
 
                 append_log(log_handle, {
                     "event": "row_start",
                     "row_index": row_idx,
-                    "upwork_name": norm(row.get("Full Name", "")),
+                    "upwork_name": features.full_name,
                     "query_count": len(queries),
                     "timestamp": time.time(),
                 })
@@ -722,7 +1069,7 @@ def main():
                     append_log(log_handle, {
                         "event": "query",
                         "row_index": row_idx,
-                        "upwork_name": norm(row.get("Full Name", "")),
+                        "upwork_name": features.full_name,
                         "query": q,
                         "timestamp": time.time(),
                     })
@@ -752,14 +1099,15 @@ def main():
                                 "event": "candidate_skipped",
                                 "reason": "duplicate_url",
                                 "row_index": row_idx,
-                                "upwork_name": norm(row.get("Full Name", "")),
+                                "upwork_name": features.full_name,
                                 "query": q,
                                 "url": url,
                                 "timestamp": time.time(),
                             })
                             continue
                         seen_urls.add(url)
-                        score, signals = score_candidate(item, row)
+                        score, signals = score_candidate(item, features)
+                        rejection_reason = next((s for s in signals if s.startswith("reject:")), None)
                         core_signals = {s for s in signals if not s.startswith("reject")}
                         if args.debug_serp:
                             print(
@@ -780,15 +1128,31 @@ def main():
                         elif has_name_lock:
                             allow_candidate = True
 
+                        candidate_counter += 1
+                        slug_tokens = extract_candidate_slug_tokens(url)
+                        candidate = CandidateEvidence(
+                            candidate_id=f"cand_{candidate_counter}",
+                            score=score,
+                            signals=signals,
+                            raw_item=item,
+                            query=q,
+                            rule_rank=0,
+                            url=url,
+                            slug_tokens=slug_tokens,
+                            derived_last_initial=parse_candidate_last_initial(item),
+                            first_name_in_url=bool(features.first_name and features.first_name.lower() in slug_tokens),
+                            rejection_reason=rejection_reason,
+                        )
+
                         if allow_candidate:
-                            candidates.append((score, signals, item, q))
+                            candidates.append(candidate)
                             if score >= args.accept_threshold + 2 and len(core_signals) >= 3:
                                 strong_hit_found = True
 
                         append_log(log_handle, {
                             "event": "candidate",
                             "row_index": row_idx,
-                            "upwork_name": norm(row.get("Full Name", "")),
+                            "upwork_name": features.full_name,
                             "query": q,
                             "url": url,
                             "title": item.get("title", ""),
@@ -797,6 +1161,11 @@ def main():
                             "signals": signals,
                             "accepted": allow_candidate,
                             "provider": args.provider,
+                            "candidate_id": candidate.candidate_id,
+                            "slug_tokens": candidate.slug_tokens,
+                            "derived_last_initial": candidate.derived_last_initial,
+                            "first_name_in_url": candidate.first_name_in_url,
+                            "rejection_reason": rejection_reason,
                             "timestamp": time.time(),
                         })
 
@@ -804,33 +1173,42 @@ def main():
                     if strong_hit_found:
                         break
 
-                # Sort candidates by score (highest first)
-                candidates.sort(key=lambda x: x[0], reverse=True)
+                # Sort candidates by score (highest first) and assign ranks
+                candidates.sort(key=lambda c: c.score, reverse=True)
+                for idx, cand in enumerate(candidates, start=1):
+                    cand.rule_rank = idx
 
                 # Optional LLM rerank
-                if args.llm_rerank and candidates:
-                    candidates = llm_rerank_candidates(
-                        row,
-                        candidates,
-                        model=args.llm_model,
-                        keep_threshold=args.llm_keep_threshold,
-                        top_k=args.llm_top_k,
-                    )
-
                 # Write one row per candidate (multiple rows per Upwork person)
-                upwork_location = f"{norm(row.get('City'))}, {norm(row.get('Country'))}".strip(", ")
+                upwork_location = features.upwork_location
                 upwork_skills = norm(row.get('Skills', ''))
-                
+
                 if candidates:
-                    for score, signals, item, q in candidates:
+                    for cand in candidates:
+                        score = cand.score
+                        signals = cand.signals
+                        item = cand.raw_item
+                        q = cand.query
                         unique_signals = {s for s in signals if not s.startswith("reject")}
+                        if cand.llm_selected:
+                            unique_signals.add("llm_selected")
+                        elif cand.llm_rank and cand.llm_rank > 1:
+                            unique_signals.add(f"llm_rank_{cand.llm_rank}")
                         confidence = pick_confidence(score, args.accept_threshold, args.review_threshold)
+                        if cand.llm_selected and cand.llm_confidence is not None:
+                            llm_threshold = 0.6
+                            if cand.llm_confidence >= max(llm_threshold, 0.85):
+                                confidence = "High"
+                            elif cand.llm_confidence >= llm_threshold:
+                                confidence = "Medium"
+                        if cand.llm_reject_reason:
+                            unique_signals.add("llm_reject")
                         if confidence == "High" and len(unique_signals) < 3:
                             confidence = "Medium"
                         elif confidence == "Medium" and len(unique_signals) < 2:
                             confidence = "Low"
                         out_row = {
-                            "upwork_name": norm(row.get("Full Name", "")),
+                            "upwork_name": features.full_name,
                             "upwork_title": norm(row.get("Title", "")),
                             "upwork_location": upwork_location,
                             "upwork_skills": upwork_skills[:200] + "..." if len(upwork_skills) > 200 else upwork_skills,  # Truncate long skills
@@ -840,13 +1218,17 @@ def main():
                             "match_score": score,
                             "confidence": confidence,
                             "matched_signals": ",".join(sorted(unique_signals)),
-                            "query_used": q
+                            "query_used": q,
+                            "llm_selected": "yes" if cand.llm_selected else ("secondary" if cand.llm_rank and cand.llm_rank > 1 else ""),
+                            "llm_confidence": f"{cand.llm_confidence:.2f}" if cand.llm_confidence is not None else "",
+                            "llm_rationale": truncate_text(cand.llm_rationale, 300) if cand.llm_rationale else (cand.llm_reject_reason or ""),
+                            "llm_rank": cand.llm_rank or "",
                         }
                         writer.writerow(out_row)
                 else:
                     # Write one row showing no matches found
                     out_row = {
-                        "upwork_name": norm(row.get("Full Name", "")),
+                        "upwork_name": features.full_name,
                         "upwork_title": norm(row.get("Title", "")),
                         "upwork_location": upwork_location,
                         "upwork_skills": upwork_skills[:200] + "..." if len(upwork_skills) > 200 else upwork_skills,
@@ -856,7 +1238,11 @@ def main():
                         "match_score": 0,
                         "confidence": "None",
                         "matched_signals": "",
-                        "query_used": ""
+                        "query_used": "",
+                        "llm_selected": "",
+                        "llm_confidence": "",
+                        "llm_rationale": features.llm_decision.get("decision", {}).get("reject_reason") if features.llm_decision else "",
+                        "llm_rank": "",
                     }
                     writer.writerow(out_row)
     finally:
