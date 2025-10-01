@@ -1,373 +1,395 @@
-## Upwork → LinkedIn Matcher
+# Upwork → LinkedIn Matcher
 
-Row-driven person resolution from an Upwork export (CSV) to likely LinkedIn profile URLs using a SERP provider (Serper or SerpAPI), with rule-based scoring and an optional LLM reranker for semantic relevance.
+A modular system for matching Upwork freelancer profiles to LinkedIn profiles using SERP APIs and optional LLM reranking. The system uses rule-based scoring with semantic refinement to achieve high-precision matches.
 
-This guide explains:
-- What the script does end-to-end
-- Required input columns and the output schema
-- Configuration (env vars) and CLI flags
-- Query strategy, scoring signals, and inclusion gates (last-initial, must-have role/freelance)
-- Optional LLM reranking (OpenAI Responses API, gpt-5-nano)
-- Limitations, roadmap, and troubleshooting
-- How to install and run on your CSV
+## Quick Start
 
----
-
-## Overview
-
-Given a CSV of Upwork freelancers, the script:
-- Parses each row and derives a search plan using that row’s own fields (no global dictionaries)
-- Calls a SERP provider to Google-search only LinkedIn profile URLs
-- Scores each candidate result (from SERP title/snippet), retains good ones, and writes a CSV
-- Optionally reranks/filters the top candidates per row using an LLM for semantic relevance
-
-Key safeguards:
-- First-name guard (must be present in title/snippet)
-- Last-initial enforcement (rejects candidates whose last-name initial conflicts with Upwork’s)
-- Role/freelance must-have gate (filters off-topic results)
-
----
-
-## Latest learnings: simple, high-precision strategy
-
-### What to prioritize
-- Build tight queries: always use quotes and `site:linkedin.com/in`, and prefer pairing name with one strong attribute at a time (city, country, top title phrase, top skill, one school, one company, or a short description phrase).
-- Add SERP noise filters to every query: `-inurl:"/jobs/" -inurl:"/learning/" -inurl:"/school/" -inurl:"/company/"`.
-- Enforce identity early: require first-name presence in text or URL; when last initial can be inferred, require it to match.
-- Keep the inclusion gate: candidate must show role evidence (title phrase, skill, or description phrase) unless the last-initial lock is present.
-- Stop early on a strong hit: if a candidate reaches a high score with multiple signals, skip remaining queries for that row to save budget.
-- Optionally LLM rerank the top 5 only to reorder/filter borderline cases.
-
-### Prioritized query templates (first 6–8 per row)
-- `site:linkedin.com/in "First Last" "City" -inurl:"/jobs/" -inurl:"/learning/" -inurl:"/school/" -inurl:"/company/"`
-- `site:linkedin.com/in "First Last" "Country" -inurl:"/jobs/" -inurl:"/learning/" -inurl:"/school/" -inurl:"/company/"`
-- `site:linkedin.com/in "First Last" "Top Title Phrase" -inurl:"/jobs/" -inurl:"/learning/" -inurl:"/school/" -inurl:"/company/"`
-- `site:linkedin.com/in "First Last" "Top Skill" -inurl:"/jobs/" -inurl:"/learning/" -inurl:"/school/" -inurl:"/company/"`
-- `site:linkedin.com/in "First Last" "School" -inurl:"/jobs/" -inurl:"/learning/" -inurl:"/school/" -inurl:"/company/"`
-- `site:linkedin.com/in "First Last" "Company" -inurl:"/jobs/" -inurl:"/learning/" -inurl:"/school/" -inurl:"/company/"`
-- `site:linkedin.com/in "First" "Top Title Phrase" "City" -inurl:"/jobs/" -inurl:"/learning/" -inurl:"/school/" -inurl:"/company/"`
-- `"First Last" "Upwork" site:linkedin.com/in -inurl:"/jobs/" -inurl:"/learning/" -inurl:"/school/" -inurl:"/company/"`
-
-If the Upwork name is `First LastInitial`, also try the trimmed core name `First Last`.
-
-### Quick wins (recommended tweaks)
-- Add SERP noise filters (above) to all generated queries.
-- Canonicalize LinkedIn URLs before deduplication (strip tracking params, trailing slashes) so duplicates collapse reliably.
-- Strengthen freelance keywords: include `independent`, `self-employed`, `contractor`, `consultant`, `freelancer`.
-- Soft ccTLD bonus: add a small score bonus when the LinkedIn subdomain ccTLD matches the row country; use only as a secondary signal.
-
-### Recommended high-precision run
 ```bash
+# 1. Setup
+pip install --break-system-packages requests python-dotenv
+
+# 2. Configure API keys in .env file
+SERPER_API_KEY=your_serper_key
+OPENAI_API_KEY=your_openai_key
+
+# 3. Run basic matching
 python3 upwork_to_linkedin_matcher.py \
-  --input 20_upwork_profiles.csv \
-  --output test_output_20.csv \
-  --provider serper \
-  --max-queries 8 --results-per-query 8 \
-  --accept-threshold 11 --review-threshold 7 --min-score 3 \
-  --query-log query_log.jsonl --debug-serp
-```
+  --input your_upwork_profiles.csv \
+  --output results.csv \
+  --provider serper
 
-### Lightweight validation loop
-- Take a sample of ~20 profiles with known ground truth.
-- Run once and compute precision@1 manually.
-- If false positives are high: raise `--accept-threshold` or require ≥3 unique signals for High confidence (already enforced), and keep the must-have role gate ON.
-- If recall is low: add 1–2 more attribute-pair queries, allow last-initial lock to bypass the must-have role gate, or run the standalone LLM selection step on the SERP output and experiment with a slightly lower keep threshold (e.g., 0.5–0.55).
-
-## Input CSV schema (required columns)
-
-Expected headers (case sensitive):
-- **Full Name**: Upwork-style e.g., "Amna M." (only last initial)
-- **Title**: e.g., "Market Research Analyst | Competitors Analyst"
-- **Description**: long free text; short phrases may be used in queries and for LLM context
-- **Country**: e.g., "Pakistan"
-- **City**: e.g., "Lahore"
-- **Skills**: comma/pipe/semicolon separated
-- **English Level**: (unused)
-- **Education**: free text; schools are extracted using regex
-- **Employment History**: semicolon-separated; company names are extracted heuristically
-- **Certifications**: (unused)
-
-Fields primarily used: `Full Name`, `Title`, `Skills`, `City`, `Country`, `Education`, `Description` (LLM), `Employment History`.
-
----
-
-## Output CSV schema
-
-One row per kept candidate (sorted by score or LLM relevance):
-- **upwork_name** (from `Full Name`)
-- **upwork_title**
-- **upwork_location** ("City, Country")
-- **upwork_skills** (truncated to 200 chars)
-- **linkedin_url**
-- **linkedin_title**
-- **linkedin_snippet**
-- **match_score** (integer)
-- **confidence** (High | Medium | Low)
-- **matched_signals** (comma-joined signals)
-- **query_used** (the producing Google query)
-
-LLM-specific columns (present when the Responses API step runs):
-- **llm_selected** – `yes` for the model’s pick, `secondary` for remaining ranked options, blank if the model abstained
-- **llm_confidence** – model-reported 0–1 confidence (string formatted to two decimals)
-- **llm_rationale** – trimmed justification from the model (or the rejection reason when no match is chosen)
-- **llm_rank** – 1-based ordering assigned by the LLM (populated for secondary options)
-
-If a person yields no candidates after filtering, one placeholder row is written with empty LinkedIn fields and `match_score=0`.
-
----
-
-## How it searches (queries)
-
-Per row, up to `--max-queries` (deduped) are generated using:
-- `site:linkedin.com/in "{first_name}" "{title_phrase}" "{city}"`
-- `site:linkedin.com/in "{first_name}" "{top_skill}" "{country}"`
-- `"{first_name}" Upwork site:linkedin.com/in ["{city}"]`
-- `site:linkedin.com/in intitle:"{first_name}"`
-- `site:linkedin.com/in "{Full Name}" ["{city}"]`
-- Pivots using one extracted school or company when present
-
-Notes:
-- `first_name` is derived from `Full Name`; `last_initial` is only used during scoring.
-- Title phrases come from `Title`; top skills come from `Skills`.
-- Schools are extracted from `Education`; companies from `Employment History`.
-- Short 3–6 word phrases can be extracted from `Description` and used in paired queries when present.
-
----
-
-## How it scores (signals)
-
-From candidate SERP `title + snippet` (visible text only):
-
-Hard checks (reject):
-- Missing first name in text
-- Last-initial mismatch (parsed from LinkedIn URL slug or SERP title)
-
-Positive evidence (additive):
-- **city** in text: +5
-- **country** in text: +3
-- **alt_location** (location tokens derived from Education/Description/Employment): +3 (first match)
-- **title_phrase** (from Upwork `Title`): +4
-- **skill** (from Upwork `Skills`): +3
-- **education** (school name from Upwork `Education`): +3
-- **company** (from Upwork `Employment History`): +3
-- **freelance/Upwork** keywords: +3
-- **last_initial_match**: +5
-
-Confidence buckets (from score):
-- **High**: ≥ `--accept-threshold` (default 10)
-- **Medium**: ≥ `--review-threshold` (default 7)
-- **Low**: otherwise ≥ `--min-score` (default 3)
-
-Confidence adjustment based on unique signals:
-- High confidence is downgraded to Medium if fewer than 3 unique positive signals are present.
-- Medium confidence is downgraded to Low if fewer than 2 unique positive signals are present.
-
-Inclusion gate (precision control):
-- Score must be ≥ `--min-score`
-- Must-have role/freelance (default): candidate must include at least one of `title_phrase` OR `skill` OR `description` phrase
-  - Disable with `--no-require-role-signal` if you prefer higher recall at the risk of off-topic matches
-
----
-
-## Optional LLM reranker (OpenAI Responses API, `gpt-5-nano`)
-
-The LLM selection step (`llm_select_existing.py`) sends the top `--llm-top-k` candidates per row to the OpenAI Responses API. The payload contains:
-
-- **Upwork profile context** – full name and variants, first/last initial, title, top skills, description phrases, certifications, extracted schools/companies, employment summary, city/country, location aliases
-- **Candidate context** – LinkedIn URL, slug tokens, derived last initial, first-name-in-url flag, SERP title/snippet, rule score, producing query, matched signals
-- **Guardrails** – first name must align, last initial (when present) must match, favour role/location alignment, allow abstaining when confidence is low
-
-Responses are requested as JSON schema:
-```json
-{
-  "best_candidate_id": "cand_3" | null,
-  "confidence": 0.0-1.0,
-  "rationale": "short reasoning",
-  "secondary_candidate_ids": ["cand_5", "cand_2"],
-  "reject_reason": "optional explanation when no match"
-}
-```
-
-Acceptance and ordering:
-- Accept only if `confidence ≥ --llm-keep-threshold` (default 0.6); otherwise fall back to rule ordering
-- Return a single candidate in `select` mode, or keep all ranked candidates in `assist` mode (primary + secondary ordering)
-- On API errors, the rule-based ordering is preserved
-
-Telemetry & attribution:
-- Requests use `store=true` and include metadata (`source`, row city/country) for observability in the OpenAI dashboard
-- `OPENAI_ORG_ID` / `OPENAI_PROJECT_ID` headers are forwarded when present
-
-Token/cost control:
-- Only the top `--llm-top-k` (default 5) candidates are sent
-- `max_output_tokens` is capped (900) and `reasoning.effort` is set to `low` for nano-tier models
-
-> **Prompt engineering notes**
-> - Injecting the full Upwork profile (skills, employment, education, certifications, description snippets) materially improves discrimination on common names.
-> - Providing slug tokens and location aliases helps the model reason about URL structure and geographic hints beyond the snippet.
-> - Keep the schema strict (`additionalProperties=false`) so malformed outputs are rejected early.
-
-### LLM-only pass on existing SERP output
-
-Already have a SERP results CSV (e.g., `test_output_20.csv`)? Run the LLM selection step without hitting the search API:
-
-```bash
+# 4. Add LLM selection (recommended)
 python3 llm_select_existing.py \
-  --upwork 20_upwork_profiles.csv \
-  --candidates test_output_20.csv \
-  --output 20_upwork_llm_results.csv \
+  --upwork your_upwork_profiles.csv \
+  --candidates results.csv \
+  --output final_results.csv \
   --llm-model gpt-5-nano-2025-08-07 \
-  --llm-keep-threshold 0.6 \
-  --query-log query_log_llm.jsonl
+  --llm-keep-threshold 0.5
 ```
 
-What happens under the hood:
-- Rebuilds the same `RowFeatures` objects from the original Upwork CSV (so the LLM still sees full descriptions, education, employment, certifications, etc.)
-- Converts each candidate row into `CandidateEvidence` (rule score, matched signals, slug tokens, derived last initial, producing query)
-- Pipes the top `--llm-top-k` candidates per freelancer into the Responses API and annotates the results with `llm_selected`, `llm_confidence`, `llm_rationale`, and `llm_rank`
-- Optionally logs the full (truncated) JSON responses for audit/debugging
+## Performance Benchmarks
 
-This is the recommended workflow when you already have a `test_output.csv` from an earlier run and just want to layer the LLM decisioning on top.
+Based on testing with 51 profiles against golden dataset:
+
+- **SERP Coverage**: 51% (26/51 profiles found)
+- **LLM Selection (threshold 0.5)**: 73.1% success rate when SERP found correct profile (19/26)
+- **End-to-End Success**: 37.3% (19/51 correct matches)
+- **LLM Precision**: 59.4% when making selections
+- **False Positive Rate**: 25.5% (13 wrong selections)
+
+**Key Insight**: The primary bottleneck is SERP coverage (finding the right LinkedIn profiles in search results), not LLM selection accuracy. Improving search queries and expanding candidate pools yields the highest gains.
 
 ---
 
-## Providers & environment variables
+## System Architecture
 
-Supported providers:
-- **serper** (default): `https://google.serper.dev/search` (POST JSON)
-- **serpapi**: `https://serpapi.com/search` (GET)
+The system is modularized into focused components:
 
-`.env` (auto-loaded via `python-dotenv`):
-
-Search keys:
-- `SERP_PROVIDER=serper|serpapi` (or pass `--provider`)
-- For Serper: `SERPER_API_KEY=...`
-- For SerpAPI: `SERPAPI_API_KEY=...`
-
-LLM keys (only if you plan to run the LLM selection script):
-- `OPENAI_API_KEY=...`
-- Optional attribution: `OPENAI_ORG_ID=...`, `OPENAI_PROJECT_ID=...`
-
-Python deps:
-- `requests`, `python-dotenv`
+- **`upwork_to_linkedin_matcher.py`** - Main orchestration script (459 lines, down from 1833)
+- **`providers.py`** - SERP API integrations (Serper, SerpAPI)
+- **`models.py`** - Data structures and constants
+- **`features.py`** - Text processing and feature extraction
+- **`queries.py`** - Search query generation strategies
+- **`scoring.py`** - Candidate scoring and matching logic
+- **`llm.py`** - OpenAI integration for semantic reranking
+- **`utils.py`** - Common utilities
+- **`llm_select_existing.py`** - Standalone LLM selection script
 
 ---
 
-## Install & setup
+## How It Works
+
+### 1. Feature Extraction
+From each Upwork profile, the system extracts:
+- **Name variants**: Handles cultural naming patterns and permutations
+- **Geographic signals**: City, country, location aliases
+- **Professional context**: Title phrases, top skills, companies, schools
+- **Descriptive phrases**: Key phrases from descriptions
+
+### 2. Query Generation
+Generates targeted LinkedIn searches using patterns like:
+- `site:linkedin.com/in "First Last" "City" -inurl:"/jobs/"`
+- `site:linkedin.com/in "First Name" "Top Skill" "Country"`
+- `"First Name" "Title Phrase" site:linkedin.com/in`
+
+### 3. Scoring System
+Multi-signal scoring with hard guards:
+
+**Hard Rejections:**
+- Missing first name in profile text
+- Last initial mismatch
+
+**Positive Signals (additive):**
+- City match: +5 points
+- Country match: +3 points
+- Title phrase match: +4 points
+- Skill match: +3 points
+- Education/Company match: +3 points each
+- Last initial match: +5 points
+
+**Confidence Levels:**
+- High: ≥10 points (accept threshold)
+- Medium: ≥7 points (review threshold)
+- Low: ≥3 points (minimum score)
+
+### 4. LLM Refinement (Recommended)
+Uses GPT-5-nano with reasoning capabilities to semantically evaluate top candidates:
+
+**Decision Framework:**
+- Requires name match (first name + last initial)
+- Looks for 1+ supporting signals: location, skills, role, company, education
+- Returns single best match with confidence score (0.0-1.0)
+- Provides detailed rationale for selection/rejection
+
+**Optimal Settings:**
+- `--llm-keep-threshold 0.5` (balanced precision/recall)
+- `--llm-top-k 5` (candidates sent to LLM)
+- Model: `gpt-5-nano-2025-08-07` (supports reasoning.effort parameter)
+
+---
+
+## Input Requirements
+
+Your CSV must contain these columns (case-sensitive):
+
+- **Full Name**: "Amna M." format (first name + last initial)
+- **Title**: Role/title information
+- **Description**: Free text description
+- **Country**: "Pakistan", "Serbia", etc.
+- **City**: "Lahore", "Belgrade", etc.
+- **Skills**: Comma/pipe/semicolon separated skills
+- **Education**: Educational background (schools extracted automatically)
+- **Employment History**: Work history (companies extracted automatically)
+
+Optional columns: English Level, Certifications, Profile URL
+
+---
+
+## Configuration
+
+### Environment Variables (.env file)
 
 ```bash
-cd /path/to/this/folder/linkedin_matcher
-python3 -m venv .venv
-. .venv/bin/activate
-pip install requests python-dotenv
-```
-
-Create `.env`:
-```bash
-# Choose one provider
+# Required: Choose one SERP provider
 SERP_PROVIDER=serper
-SERPER_API_KEY=YOUR_SERPER_KEY
+SERPER_API_KEY=your_serper_key_here
+# OR
+SERPAPI_API_KEY=your_serpapi_key_here
 
-# Optional LLM reranker
-OPENAI_API_KEY=YOUR_OPENAI_KEY
-# Optional attribution
-# OPENAI_ORG_ID=org_xxx
-# OPENAI_PROJECT_ID=proj_xxx
+# Required for LLM features
+OPENAI_API_KEY=sk-proj-your_openai_key_here
+
+# Optional OpenAI attribution
+OPENAI_ORG_ID=org-your_org_id
+OPENAI_PROJECT_ID=proj-your_project_id
+
+# Optional alternative provider
+FIRECRAWL_API_KEY=fc-your_firecrawl_key
+```
+
+### Key Command Line Options
+
+**Basic Matching:**
+```bash
+--input path/to/input.csv        # Input Upwork profiles
+--output path/to/output.csv      # Output results
+--provider serper|serpapi        # SERP provider choice
+--max-queries 10                 # Queries per profile (default: 6)
+--min-score 1                    # Minimum score to include (default: 3)
+```
+
+**Quality Controls:**
+```bash
+--accept-threshold 10            # High confidence threshold
+--review-threshold 7             # Medium confidence threshold
+--no-score-filter               # Include all matches regardless of score
+--no-require-role-signal        # Disable role/skill requirement
+```
+
+**LLM Options:**
+```bash
+--llm-model gpt-5-nano-2025-08-07    # Model to use (supports reasoning)
+--llm-keep-threshold 0.5             # Minimum LLM confidence (recommended)
+--llm-top-k 5                        # Max candidates to send to LLM (recommended)
 ```
 
 ---
 
-## CLI flags (common)
+## Usage Examples
 
-- `--input` (required): path to input CSV
-- `--output` (required): path to output CSV
-- `--provider`: `serper` (default) or `serpapi`
-- `--accept-threshold` (default 10), `--review-threshold` (default 7)
-- `--max-queries` (default 6), `--results-per-query` (default 5)
-- `--hl` (default `en`), `--gl` (default `us`)
-- `--sleep-min` (default 0.8), `--sleep-max` (default 1.8)
-- `--min-score` (default 3)
-- `--no-require-role-signal` (disable must-have role/freelance gate)
-
----
-
-## How to run
-
-Rule-based only:
+### Basic High-Precision Run
 ```bash
 python3 upwork_to_linkedin_matcher.py \
-  --input latest_people.csv \
-  --output linkedin_matches.csv \
+  --input profiles.csv \
+  --output results.csv \
   --provider serper \
-  --max-queries 6 --results-per-query 5
+  --accept-threshold 11 \
+  --min-score 3 \
+  --max-queries 8
 ```
 
-Add the LLM post-processing step:
+### High-Coverage Run
 ```bash
-python3 llm_select_existing.py \
-  --upwork latest_people.csv \
-  --candidates test_output.csv \
-  --output latest_people_llm.csv \
-  --llm-model gpt-5-nano-2025-08-07 \
-  --llm-keep-threshold 0.6
+python3 upwork_to_linkedin_matcher.py \
+  --input profiles.csv \
+  --output results.csv \
+  --provider serper \
+  --min-score 1 \
+  --no-score-filter \
+  --max-queries 10
 ```
 
-Tighten precision further:
-- Raise `--min-score` to 7–8
-- Keep must-have gate ON and run the LLM selection with a higher `--llm-keep-threshold`
+### LLM-Enhanced Workflow
+```bash
+# Step 1: Generate candidates
+python3 upwork_to_linkedin_matcher.py \
+  --input profiles.csv \
+  --output candidates.csv \
+  --min-score 1 \
+  --max-queries 10
 
-Notes:
-- Increase `--sleep-*` for politeness and to avoid rate limits
-- Consider region bias via `--gl` per row/country if you localize runs
+# Step 2: LLM selection
+python3 llm_select_existing.py \
+  --upwork profiles.csv \
+  --candidates candidates.csv \
+  --output final_results.csv \
+  --llm-model gpt-5-nano-2025-08-07 \
+  --llm-keep-threshold 0.5 \
+  --llm-top-k 5
+```
+
+### Analysis and Validation
+```bash
+# Compare results against golden dataset
+python3 compare_all_results.py
+
+# Analyze LLM selection performance
+python3 analyze_llm_selection.py
+```
 
 ---
 
-## Tuning recall vs precision
+## Output Format
 
-- More recall: lower `--min-score`, disable must-have (`--no-require-role-signal`), raise `--results-per-query`
-- More precision: keep must-have ON, raise `--min-score`, and layer the LLM selection pass on top of the SERP CSV (optionally tightening `--llm-keep-threshold` or reducing `--llm-top-k` there)
+Each result row contains:
+
+**Upwork Context:**
+- `upwork_name`, `upwork_title`, `upwork_location`, `upwork_skills`
+
+**LinkedIn Match:**
+- `linkedin_url`, `linkedin_title`, `linkedin_snippet`
+
+**Scoring Details:**
+- `match_score` (integer), `confidence` (High/Medium/Low)
+- `matched_signals` (comma-separated list)
+- `query_used` (the search query that found this match)
+
+**LLM Analysis (when used):**
+- `llm_selected` (yes/secondary/blank)
+- `llm_confidence` (0.0-1.0)
+- `llm_rationale` (reasoning for selection/rejection)
+- `llm_rank` (1-based ranking)
 
 ---
 
-## Limitations
+## Optimization Strategies
 
-- **SERP snippets**: scoring depends on visible title/snippet; if signals aren’t shown, good candidates can be missed
-- **Name ambiguity**: first-name + last initial is weak for very common names; gates + LLM reduce but don’t eliminate edge cases
-- **Heuristic extraction**: school/company parsing is best-effort
-- **LLM cost/latency**: controlled via the selection script’s `--llm-top-k`; still adds overhead
-- **Globalization**: non-English/transliterated names may lower quality; tune `--hl`/`--gl`
+### For Higher Precision
+1. **Increase scoring thresholds**: `--accept-threshold 12 --min-score 5`
+2. **Keep role requirements**: Don't use `--no-require-role-signal`
+3. **Use LLM selection**: Add the LLM step with `--llm-keep-threshold 0.5+`
+4. **Focus queries**: Use fewer, more targeted queries
 
----
+### For Higher Recall
+1. **Lower thresholds**: `--min-score 1` or `--no-score-filter`
+2. **More queries**: `--max-queries 10+`
+3. **Disable filters**: `--no-require-role-signal`
+4. **Lower LLM threshold**: `--llm-keep-threshold 0.4` (below 0.5 increases false positives)
 
-## Roadmap
-
-- Dynamic `--gl` from row country to improve locality
-- ccTLD scoring bonus/penalty (match vs mismatch country)
-- Cap top-N candidates per person
-- Add caching of SERP results by query
-- Demote generic queries when high-precision ones exist
-- Optional debug JSONL with LLM decisions per candidate
-- Conservative parallelization
+### Name Handling Improvements
+The system includes cultural name variations:
+- "Necip Eray D." → tries "Eray Necip", "Necip Eray Damar", "Eray Damar"
+- "Anastasiia G." → preserves unique spelling with conservative variations
+- General permutations for two-part names
 
 ---
 
 ## Troubleshooting
 
-- `ModuleNotFoundError: No module named 'requests'`
-  - Activate venv and `pip install requests python-dotenv`
+### No Results Found
+```bash
+# Try lower thresholds
+--min-score 1 --no-score-filter
 
-- No matches for some rows
-  - Loosen: `--no-require-role-signal` or lower `--min-score`
-  - Or run the LLM selection script with a lower `--llm-keep-threshold` (e.g., 0.5) to let the model surface borderline matches
+# More queries per profile
+--max-queries 10 --results-per-query 8
 
-- Too many irrelevant matches
-  - Keep must-have ON, raise `--min-score` (7–8), and run the LLM selection pass with a higher `--llm-keep-threshold`
+# Disable role requirement
+--no-require-role-signal
+```
 
-- See LLM spend/logs on OpenAI platform
-  - Ensure `OPENAI_API_KEY` is set; calls are sent with `store=true`, `user`, and `metadata`
-  - Optionally set `OPENAI_ORG_ID` and `OPENAI_PROJECT_ID` for better attribution
+### Too Many False Positives
+```bash
+# Stricter scoring
+--min-score 5 --accept-threshold 12
+
+# Add LLM filtering
+python3 llm_select_existing.py --llm-keep-threshold 0.6
+```
+
+### LLM Not Working
+1. **Check API key**: Ensure `OPENAI_API_KEY` is in `.env`
+2. **Install dotenv**: `pip install python-dotenv`
+3. **Verify model**: Use `gpt-5-nano-2025-08-07` or `gpt-3.5-turbo`
+
+### Rate Limiting
+```bash
+# Add delays between requests
+--sleep-min 1.5 --sleep-max 3.0
+
+# Reduce query volume
+--max-queries 5 --results-per-query 3
+```
 
 ---
 
-## Safety & compliance
+## API Costs & Limits
 
-Use SERP providers within their ToS and rate limits. Respect local laws and target platform policies. This tool relies on public SERPs and does not crawl LinkedIn pages directly.
+### SERP API Usage
+- **Serper**: ~$5 per 1000 queries
+- **SerpAPI**: ~$50 per 1000 queries
+- Estimate: 6-10 queries per profile
+
+### OpenAI Usage (LLM step)
+- **GPT-5-nano**: $0.05/1M input tokens, $0.40/1M output tokens
+- Estimate: ~$0.01-0.02 per profile for LLM selection
+- Only top 5 candidates sent to reduce costs
+
+---
+
+## Advanced Features
+
+### Query Logging
+```bash
+--query-log queries.jsonl --debug-serp
+```
+Logs all search queries and responses for debugging.
+
+### Batch Processing
+```bash
+# Process large files in chunks
+python3 batch_processor.py --chunk-size 50 --input large_file.csv
+```
+
+### Custom Scoring
+Modify `scoring.py` to adjust signal weights:
+```python
+SIGNAL_SCORES = {
+    'city': 5,
+    'country': 3,
+    'title_phrase': 4,
+    'skill': 3,
+    # ... customize as needed
+}
+```
+
+---
+
+## Limitations & Considerations
+
+### Technical Limitations
+- **SERP dependency**: Results quality depends on search engine snippets
+- **Name ambiguity**: Common names may produce false matches
+- **Geographic bias**: Search results may favor certain regions
+- **Rate limits**: API quotas may limit processing speed
+
+### Data Quality Factors
+- **Incomplete profiles**: Missing skills/location data reduces match quality
+- **Transliteration**: Non-English names may have spelling variations
+- **Professional context**: Generic titles/skills provide weak signals
+
+### Cost Considerations
+- SERP API costs scale with profile count and query volume
+- LLM costs are controlled but add overhead for large batches
+- Consider cost/accuracy tradeoffs for your use case
+
+---
+
+## Contributing
+
+The modular architecture makes it easy to:
+- Add new SERP providers in `providers.py`
+- Modify scoring logic in `scoring.py`
+- Enhance query strategies in `queries.py`
+- Customize feature extraction in `features.py`
+
+---
+
+## License & Compliance
+
+This tool uses public SERP APIs and respects:
+- Provider terms of service and rate limits
+- LinkedIn's robots.txt (no direct crawling)
+- Data privacy and applicable regulations
+
+Ensure compliance with local laws and platform policies before use.# linkedin_matcher_v2
