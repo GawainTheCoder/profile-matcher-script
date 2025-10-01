@@ -21,18 +21,18 @@ import json
 import time
 from typing import Dict, List, Iterable
 
-from upwork_to_linkedin_matcher import (
-    RowFeatures,
-    CandidateEvidence,
-    prepare_row_features,
-    extract_candidate_slug_tokens,
-    parse_candidate_last_initial,
-    llm_rerank_candidates,
-    pick_confidence,
-    norm,
-    truncate_text,
-    append_log,
-)
+# Load environment variables
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
+from models import RowFeatures, CandidateEvidence
+from features import prepare_row_features
+from scoring import extract_candidate_slug_tokens, parse_candidate_last_initial
+from llm import llm_rerank_candidates
+from utils import pick_confidence, norm, truncate_text, append_log
 
 
 def load_upwork_rows(path: str) -> Dict[str, Dict[str, str]]:
@@ -180,18 +180,41 @@ def main() -> None:
                 upwork_skills = upwork_skills[:200] + "..."
 
             if candidates:
+                # Only output the top LLM-selected candidate (if any)
+                top_candidate = None
                 for cand in candidates:
+                    if cand.llm_selected:
+                        top_candidate = cand
+                        break
+
+                # If no LLM selection, write empty row
+                if not top_candidate:
+                    writer.writerow({
+                        "upwork_name": features.full_name,
+                        "upwork_title": upwork_title,
+                        "upwork_location": upwork_location,
+                        "upwork_skills": upwork_skills,
+                        "linkedin_url": "",
+                        "linkedin_title": "",
+                        "linkedin_snippet": "",
+                        "match_score": 0,
+                        "confidence": "None",
+                        "matched_signals": "llm_no_selection",
+                        "query_used": "",
+                        "llm_selected": "no",
+                        "llm_confidence": "",
+                        "llm_rationale": "No suitable match found above threshold",
+                        "llm_rank": "",
+                    })
+                else:
+                    # Write only the top selected candidate
+                    cand = top_candidate
                     score = cand.score
                     unique_signals = {s for s in cand.signals if s}
-                    if cand.llm_selected:
-                        unique_signals.add("llm_selected")
-                    if cand.llm_rank and cand.llm_rank > 1:
-                        unique_signals.add(f"llm_rank_{cand.llm_rank}")
-                    if cand.llm_reject_reason:
-                        unique_signals.add("llm_reject")
+                    unique_signals.add("llm_selected")
 
                     confidence = pick_confidence(score, args.accept_threshold, args.review_threshold)
-                    if cand.llm_selected and cand.llm_confidence is not None:
+                    if cand.llm_confidence is not None:
                         if cand.llm_confidence >= max(args.llm_keep_threshold, 0.85):
                             confidence = "High"
                         elif cand.llm_confidence >= args.llm_keep_threshold:
@@ -213,10 +236,10 @@ def main() -> None:
                         "confidence": confidence,
                         "matched_signals": ",".join(sorted(unique_signals)),
                         "query_used": cand.query,
-                        "llm_selected": "yes" if cand.llm_selected else ("secondary" if cand.llm_rank and cand.llm_rank > 1 else ""),
+                        "llm_selected": "yes",
                         "llm_confidence": f"{cand.llm_confidence:.2f}" if cand.llm_confidence is not None else "",
-                        "llm_rationale": truncate_text(cand.llm_rationale, 300) if cand.llm_rationale else (cand.llm_reject_reason or ""),
-                        "llm_rank": cand.llm_rank or "",
+                        "llm_rationale": truncate_text(cand.llm_rationale, 300) if cand.llm_rationale else "",
+                        "llm_rank": "1",
                     })
             else:
                 writer.writerow({
